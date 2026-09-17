@@ -1,120 +1,156 @@
+import os
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
 
-# Import our database and model files
-import models
-from database import engine, get_db
+# Absolute path configuration for permanent data persistence
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'fleet.db')}"
 
-# This command tells SQLAlchemy to create the SQLite tables if they don't exist yet
-models.Base.metadata.create_all(bind=engine)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# SQLAlchemy Models
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+    id = Column(Integer, primary_key=True, index=True)
+    license_plate = Column(String, unique=True, index=True)
+    model = Column(String)
+    status = Column(String, default="Active")
+
+class Driver(Base):
+    __tablename__ = "drivers"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    phone = Column(String)
+    license_number = Column(String)
+
+class Delivery(Base):
+    __tablename__ = "deliveries"
+    id = Column(Integer, primary_key=True, index=True)
+    item_name = Column(String)
+    destination = Column(String)
+    status = Column(String, default="Pending")
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=True)
+    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=True)
+
+    vehicle = relationship("Vehicle")
+    driver = relationship("Driver")
+
+class VehicleLog(Base):
+    __tablename__ = "vehicle_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"))
+    log_type = Column(String)
+    cost = Column(Float)
+    description = Column(String)
+    date = Column(String)
+
+    vehicle = relationship("Vehicle")
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Smart Fleet & Delivery Management System")
 
-# --- Pydantic Schemas (For validating incoming/outgoing data) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 class VehicleCreate(BaseModel):
     license_plate: str
     model: str
-    status: str = "Available"
+    status: str = "Active"
 
-class VehicleResponse(VehicleCreate):
-    id: int
-
-    class Config:
-        from_attributes = True  # Allows SQLAlchemy models to convert to Pydantic
+class DriverCreate(BaseModel):
+    name: str
+    phone: str
+    license_number: str
 
 class DeliveryCreate(BaseModel):
-    vehicle_id: int
+    item_name: str
     destination: str
-    cargo_weight_kg: float
-    status: str = "Pending"
+    vehicle_id: int | None = None
+    driver_id: int | None = None
 
-class DeliveryResponse(DeliveryCreate):
-    id: int
+class StatusUpdate(BaseModel):
+    status: str
 
-    class Config:
-        from_attributes = True
+class LogCreate(BaseModel):
+    vehicle_id: int
+    log_type: str
+    cost: float
+    description: str
+    date: str
 
-# --- Root Endpoint ---
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Smart Fleet & Delivery Management System API with SQLite!"}
-
-# --- Vehicle Endpoints ---
-@app.post("/vehicles/", response_model=VehicleResponse)
-def register_vehicle(vehicle: VehicleCreate, db: Session = Depends(get_db)):
-    # Check if the license plate already exists in the database
-    existing_vehicle = db.query(models.VehicleModel).filter(models.VehicleModel.license_plate == vehicle.license_plate).first()
-    if existing_vehicle:
-        raise HTTPException(status_code=400, detail="License plate already registered")
-    
-    # Create a new SQLAlchemy database model instance
-    db_vehicle = models.VehicleModel(
-        license_plate=vehicle.license_plate,
-        model=vehicle.model,
-        status=vehicle.status
-    )
-    
+@app.post("/vehicles/")
+def create_vehicle(vehicle: VehicleCreate, db: Session = Depends(get_db)):
+    db_vehicle = Vehicle(**vehicle.dict())
     db.add(db_vehicle)
     db.commit()
-    db.refresh(db_vehicle)  # Refresh to get the auto-generated ID from SQLite
+    db.refresh(db_vehicle)
     return db_vehicle
 
-@app.get("/vehicles/", response_model=List[VehicleResponse])
+@app.get("/vehicles/")
 def get_vehicles(db: Session = Depends(get_db)):
-    # Fetch all records from the vehicles table
-    return db.query(models.VehicleModel).all()
+    return db.query(Vehicle).all()
 
-# --- Delivery Endpoints ---
-@app.post("/deliveries/", response_model=DeliveryResponse)
+@app.post("/drivers/")
+def create_driver(driver: DriverCreate, db: Session = Depends(get_db)):
+    db_driver = Driver(**driver.dict())
+    db.add(db_driver)
+    db.commit()
+    db.refresh(db_driver)
+    return db_driver
+
+@app.get("/drivers/")
+def get_drivers(db: Session = Depends(get_db)):
+    return db.query(Driver).all()
+
+@app.post("/deliveries/")
 def create_delivery(delivery: DeliveryCreate, db: Session = Depends(get_db)):
-    # Verify that the assigned vehicle actually exists in the database
-    vehicle = db.query(models.VehicleModel).filter(models.VehicleModel.id == delivery.vehicle_id).first()
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Assigned vehicle not found. Register the vehicle first.")
-    
-    db_delivery = models.DeliveryModel(
-        vehicle_id=delivery.vehicle_id,
-        destination=delivery.destination,
-        cargo_weight_kg=delivery.cargo_weight_kg,
-        status=delivery.status
-    )
-    
+    db_delivery = Delivery(**delivery.dict(), status="Pending")
     db.add(db_delivery)
     db.commit()
     db.refresh(db_delivery)
     return db_delivery
 
-@app.get("/deliveries/", response_model=List[DeliveryResponse])
+@app.get("/deliveries/")
 def get_deliveries(db: Session = Depends(get_db)):
-    # Fetch all records from the deliveries table
-    return db.query(models.DeliveryModel).all()
+    return db.query(Delivery).all()
 
-# --- Update Vehicle ---
-@app.put("/vehicles/{vehicle_id}", response_model=VehicleResponse)
-def update_vehicle(vehicle_id: int, vehicle_update: VehicleCreate, db: Session = Depends(get_db)):
-    # Find the vehicle by its ID in the database
-    db_vehicle = db.query(models.VehicleModel).filter(models.VehicleModel.id == vehicle_id).first()
-    if not db_vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    
-    # Update the fields
-    db_vehicle.license_plate = vehicle_update.license_plate
-    db_vehicle.model = vehicle_update.model
-    db_vehicle.status = vehicle_update.status
-    
+@app.patch("/deliveries/{delivery_id}/status")
+def update_delivery_status(delivery_id: int, update: StatusUpdate, db: Session = Depends(get_db)):
+    delivery = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    delivery.status = update.status
     db.commit()
-    db.refresh(db_vehicle)
-    return db_vehicle
+    db.refresh(delivery)
+    return delivery
 
-# --- Delete Vehicle ---
-@app.delete("/vehicles/{vehicle_id}")
-def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
-    db_vehicle = db.query(models.VehicleModel).filter(models.VehicleModel.id == vehicle_id).first()
-    if not db_vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    
-    db.delete(db_vehicle)
+@app.post("/logs/")
+def create_vehicle_log(log: LogCreate, db: Session = Depends(get_db)):
+    db_log = VehicleLog(**log.dict())
+    db.add(db_log)
     db.commit()
-    return {"message": f"Vehicle with ID {vehicle_id} successfully deleted"}
+    db.refresh(db_log)
+    return db_log
+
+@app.get("/logs/")
+def get_vehicle_logs(db: Session = Depends(get_db)):
+    return db.query(VehicleLog).all()
